@@ -1,11 +1,11 @@
-# cycle_gate_bot.py
-# Python 3.9+
-# Install: python -m pip install -U "aiogram>=3,<4"
+# Bot.py
+# Python 3.9+ (у тебя 3.12 — ок)
+# requirements.txt: aiogram>=3,<4
 
 import asyncio
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatMemberStatus
@@ -16,23 +16,18 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 # ==========================
 # НАСТРОЙКИ
 # ==========================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Add it in Render Environment Variables.")
-# <-- ВСТАВЬ НОВЫЙ ТОКЕН (старый Revoke!)
+    raise RuntimeError("BOT_TOKEN is not set. Add it to systemd Environment (or export BOT_TOKEN=...)")
 
-# Удаление сообщений бота
 DELETE_ON_SUCCESS_SECONDS = 3
 DELETE_ON_FAIL_SECONDS = 30
 
-# Кто всегда может писать (твои аккаунты админов). Узнай свой user_id и добавь сюда.
-# Можно оставить пустым, но лучше добавить себя.
 ADMIN_IDS = {
     # 123456789,
 }
 
-# Список групп ПО ПОРЯДКУ ЦИКЛА:
-# Чтобы писать в GROUPS[i] -> нужно состоять в GROUPS[i+1] (а для последней -> в первой)
 GROUPS: List[dict] = [
     {
         "chat": "@pokupkaprodajaoren",
@@ -44,10 +39,10 @@ GROUPS: List[dict] = [
         "link": "https://t.me/kupluprodamorenburg",
         "title": "Группа 2",
     },
-    # Добавляй сколько угодно:
-    # {"chat":"@group3", "link":"https://t.me/group3", "title":"Группа 3"},
-    # {"chat":"@group4", "link":"https://t.me/group4", "title":"Группа 4"},
 ]
+
+PIN_MARK = "🔓 Разблокировка доступа (gate)"
+
 # ==========================
 # КОНЕЦ НАСТРОЕК
 # ==========================
@@ -55,7 +50,6 @@ GROUPS: List[dict] = [
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 
-# Реальные числовые chat_id (получим при запуске)
 GROUP_CHAT_IDS: List[int] = []
 CHAT_ID_TO_INDEX: Dict[int, int] = {}
 
@@ -83,17 +77,27 @@ async def delete_later(bot: Bot, chat_id: int, message_id: int, seconds: int):
 
 
 async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Проверяем, состоит ли пользователь в нужной (следующей) группе."""
+    """
+    Проверка подписки:
+    - MEMBER/ADMIN/CREATOR = да
+    - RESTRICTED = да, только если is_member=True (то есть реально в группе)
+    """
     try:
         m = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return m.status in {
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.RESTRICTED,   # <-- ДОБАВЬ ЭТО
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR,
-        }
+
+        if m.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            return True
+
+        if m.status == ChatMemberStatus.RESTRICTED:
+            # Важно: restricted может быть "не участник" => is_member=False
+            return bool(getattr(m, "is_member", False))
+
+        return False
+
     except (TelegramForbiddenError, TelegramBadRequest):
         return False
+
+
 
 async def restrict_user(bot: Bot, target_chat_id: int, user_id: int) -> bool:
     """Запрещаем писать в текущей группе."""
@@ -132,14 +136,105 @@ async def unlock_user(bot: Bot, target_chat_id: int, user_id: int) -> bool:
         return False
 
 
+async def ensure_pinned_gate(bot: Bot):
+    """
+    В каждой группе создаём/обновляем закреплённое сообщение с кнопками.
+    Так кнопки есть всегда, даже если входное сообщение удалилось.
+    """
+    me = await bot.get_me()
+
+    for idx, chat_id in enumerate(GROUP_CHAT_IDS):
+        chat = await bot.get_chat(chat_id)
+        pinned = getattr(chat, "pinned_message", None)
+
+        # Если уже закреплено наше сообщение — обновим клавиатуру
+        if (
+            pinned
+            and pinned.from_user
+            and pinned.from_user.id == me.id
+            and pinned.text
+            and PIN_MARK in pinned.text
+        ):
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=pinned.message_id,
+                    reply_markup=build_kb(idx),
+                )
+                logging.info(f"Updated pinned gate in chat_id={chat_id}")
+            except Exception as e:
+                logging.warning(f"Cannot update pinned gate in {chat_id}: {e}")
+            continue
+
+        # Иначе — отправим новое и закрепим
+        msg = await bot.send_message(
+            chat_id,
+            f"{PIN_MARK}\n\n"
+            "Если тебе запрещено писать — вступи в следующую группу и нажми «Проверить подписку».",
+            reply_markup=build_kb(idx),
+            disable_notification=True,
+        )
+        try:
+            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+            logging.info(f"Pinned new gate in chat_id={chat_id}")
+        except Exception as e:
+            logging.warning(f"Cannot pin message in {chat_id}: {e}")
+
+
+# ==========================
+# ГЛАВНЫЙ ГЕЙТ: проверка на каждое сообщение
+# ==========================
+@dp.message()
+async def gate_on_every_message(message: Message, bot: Bot):
+    # работаем только в наших группах
+    if message.chat.id not in CHAT_ID_TO_INDEX:
+        return
+
+    # не трогаем сервисные события (вступил/вышел и т.п.)
+    if message.new_chat_members or message.left_chat_member:
+        return
+
+    # если нет отправителя — выходим
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    # ботов и админов не трогаем
+    if message.from_user.is_bot or user_id in ADMIN_IDS:
+        return
+
+    current_idx = CHAT_ID_TO_INDEX[message.chat.id]
+    nxt_idx = next_index(current_idx)
+    required_chat_id = GROUP_CHAT_IDS[nxt_idx]
+
+    ok = await is_member(bot, required_chat_id, user_id)
+
+    if ok:
+        # если был замучен, снимем (на всякий случай)
+        await unlock_user(bot, message.chat.id, user_id)
+        return
+
+    # НЕ подписан — удаляем сообщение, мутим и показываем кнопки
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await restrict_user(bot, message.chat.id, user_id)
+
+    sent = await message.answer(
+        "❌ Чтобы писать в этом чате — вступи в следующую группу и нажми «Проверить подписку» (кнопки также в закрепе).",
+        reply_markup=build_kb(current_idx),
+    )
+    asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, DELETE_ON_FAIL_SECONDS))
+
+
+# ==========================
+# Новый участник: сразу мут + подсказка (и закреп есть всегда)
+# ==========================
 @dp.message(F.new_chat_members)
 async def on_new_members(message: Message, bot: Bot):
-    """
-    Новый участник в одной из групп цикла:
-    - мутим (запрещаем писать)
-    - отправляем инструкцию (вступи в следующую + проверь)
-    - удаляем инструкцию через 30 секунд
-    """
     if message.chat.id not in CHAT_ID_TO_INDEX:
         return
 
@@ -148,43 +243,42 @@ async def on_new_members(message: Message, bot: Bot):
     for u in message.new_chat_members:
         if u.is_bot:
             continue
-
-        # админы/создатели (и ты) — без ограничений
         if u.id in ADMIN_IDS:
             continue
 
-        # мутим в текущей группе
         await restrict_user(bot, message.chat.id, u.id)
 
         sent = await message.answer(
             f"👋 {u.full_name}\n"
-            f"Чтобы писать в этом чате — вступи в следующую группу и нажми «Проверить подписку».",
+            "Чтобы писать — вступи в следующую группу и нажми «Проверить подписку» (кнопки есть в закрепе).",
             reply_markup=build_kb(current_idx),
         )
         asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, DELETE_ON_FAIL_SECONDS))
 
 
+# ==========================
+# Кнопка "Проверить подписку"
+# ==========================
 @dp.callback_query(F.data.startswith("check:"))
 async def check_sub(call: CallbackQuery, bot: Bot):
-    """
-    Проверка подписки: чтобы писать в GROUPS[current_idx],
-    надо состоять в GROUPS[next_idx].
-    """
     user_id = call.from_user.id
-
-    # если ты в ADMIN_IDS — просто открываем
-    if user_id in ADMIN_IDS:
+    try:
         current_idx = int(call.data.split(":")[1])
+    except Exception:
+        await call.answer("Неверные данные", show_alert=True)
+        return
+
+    if current_idx < 0 or current_idx >= len(GROUPS):
+        await call.answer("Неверные данные", show_alert=True)
+        return
+
+    # Админов просто открываем
+    if user_id in ADMIN_IDS:
         ok_unlock = await unlock_user(bot, GROUP_CHAT_IDS[current_idx], user_id)
         txt = "✅ Админ-доступ: ограничения сняты." if ok_unlock else "⚠️ Не смог снять ограничения (проверь права бота)."
         sent = await call.message.answer(txt)
         asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, DELETE_ON_SUCCESS_SECONDS))
         await call.answer()
-        return
-
-    current_idx = int(call.data.split(":")[1])
-    if current_idx < 0 or current_idx >= len(GROUPS):
-        await call.answer("Неверные данные", show_alert=True)
         return
 
     nxt_idx = next_index(current_idx)
@@ -193,7 +287,6 @@ async def check_sub(call: CallbackQuery, bot: Bot):
     ok = await is_member(bot, required_chat_id, user_id)
 
     if ok:
-        # открываем писать в текущей группе
         unlocked = await unlock_user(bot, GROUP_CHAT_IDS[current_idx], user_id)
         if unlocked:
             sent = await call.message.answer("✅ Подписка подтверждена! Доступ открыт — можешь писать.")
@@ -201,14 +294,13 @@ async def check_sub(call: CallbackQuery, bot: Bot):
         else:
             sent = await call.message.answer(
                 "✅ Подписка подтверждена, но я не смог открыть доступ.\n"
-                "Проверь, что бот админ в этой группе и у него есть Restrict/Ban users."
+                "Проверь, что бот админ в этой группе и у него есть Restrict users."
             )
             asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, DELETE_ON_FAIL_SECONDS))
     else:
         nxt = GROUPS[nxt_idx]
         sent = await call.message.answer(
-            f"❌ Подписки нет.\n"
-            f"Нужно вступить в следующую группу: {nxt['title']}",
+            f"❌ Подписки нет.\nНужно вступить в следующую группу: {nxt['title']}",
             reply_markup=build_kb(current_idx),
         )
         asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, DELETE_ON_FAIL_SECONDS))
@@ -224,7 +316,6 @@ async def main():
 
     bot = Bot(BOT_TOKEN)
 
-    # резолвим @username -> chat_id
     GROUP_CHAT_IDS = []
     CHAT_ID_TO_INDEX = {}
 
@@ -237,6 +328,7 @@ async def main():
     for i, g in enumerate(GROUPS):
         logging.info(f"  [{i}] {g['chat']} -> {GROUP_CHAT_IDS[i]} (next -> {GROUPS[next_index(i)]['chat']})")
 
+    await ensure_pinned_gate(bot)
     await dp.start_polling(bot)
 
 
